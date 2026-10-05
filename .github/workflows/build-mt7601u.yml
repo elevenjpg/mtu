@@ -7,8 +7,8 @@ on:
         description: Kernel source repo
         default: https://android.googlesource.com/kernel/common
       kernel_ref:
-        description: Branch, tag or FULL commit sha (short shas can't be fetched)
-        default: android12-5.10
+        description: Branch, tag or commit sha (short sha is fine)
+        default: 71f3aedc8b92
       kernel_release:
         description: Exact `uname -r` from the phone
         default: 5.10.236-android12-9-00006-g71f3aedc8b92-ab14427738
@@ -36,11 +36,10 @@ jobs:
 
       - name: Fetch kernel source (shallow)
         run: |
-          git init kernel-src
+          git clone --filter=blob:none --no-checkout "$REPO" kernel-src
           cd kernel-src
-          git remote add origin "$REPO"
-          git fetch --depth=1 origin "$REF"
-          git checkout FETCH_HEAD
+          git checkout "$REF"
+          git log -1 --format='checked out %H %s'
 
       - name: Configure
         run: |
@@ -81,4 +80,3 @@ jobs:
         with:
           name: mt7601u-modules
           path: out/*.ko
-          

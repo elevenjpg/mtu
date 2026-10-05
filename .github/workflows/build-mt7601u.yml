@@ -17,6 +17,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+
     env:
       REPO: ${{ inputs.kernel_repo }}
       REF: ${{ inputs.kernel_ref }}
@@ -33,7 +34,19 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm flex bison bc libssl-dev libelf-dev cpio kmod gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          sudo apt-get install -y \
+            clang \
+            lld \
+            llvm \
+            flex \
+            bison \
+            bc \
+            libssl-dev \
+            libelf-dev \
+            cpio \
+            kmod \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu
 
       - name: Fetch kernel source (shallow)
         run: |
@@ -44,7 +57,10 @@ jobs:
 
       - name: Configure
         run: |
-          test -f phone.config || { echo "Commit phone.config (zcat /proc/config.gz) to the repo root"; exit 1; }
+          test -f phone.config || {
+            echo "Commit phone.config (zcat /proc/config.gz) to the repo root"
+            exit 1
+          }
 
           cp phone.config kernel-src/.config
 
@@ -67,22 +83,26 @@ jobs:
           scripts/config --disable DEBUG_INFO
           scripts/config --disable DEBUG_INFO_BTF
 
-          # Do NOT replace the phone's cfg80211.
-          # Do NOT build a second mac80211 against our own cfg80211.
-          #
-          # Keep the existing phone/GKI wireless stack configuration.
-          scripts/config --disable CFG80211
-          scripts/config --disable MAC80211
-
-          # MT7601U requires mac80211/cfg80211, so enable the driver
-          # as a module. The dependency handling is intentionally left
-          # to Kconfig.
+          # Build the complete wireless dependency chain.
+          # This generates Module.symvers entries for cfg80211/mac80211.
+          scripts/config --module CFG80211
+          scripts/config --module MAC80211
           scripts/config --module MT7601U
 
           make ARCH=arm64 LLVM=1 olddefconfig
 
           echo "=== FINAL CONFIG ==="
-          grep -E "^(CONFIG_(WLAN|WLAN_VENDOR_MEDIATEK|CFG80211|MAC80211|MT7601U|TRIM_UNUSED_KSYMS|MODVERSIONS))=" .config || true
+
+          for o in CFG80211 MAC80211 MT7601U; do
+            grep -q "^CONFIG_$o=m" .config || {
+              echo "::error::CONFIG_$o did not end up =m (a dependency is off)"
+              exit 1
+            }
+          done
+
+          grep -E \
+            "^(CONFIG_(WLAN|WLAN_VENDOR_MEDIATEK|CFG80211|MAC80211|MT7601U|TRIM_UNUSED_KSYMS|MODVERSIONS))=" \
+            .config || true
 
           echo
           echo "=== KERNEL RELEASE ==="
@@ -105,32 +125,156 @@ jobs:
           df -h / | tail -1
           clang --version | head -1
 
-      - name: Prepare kernel
-        run: |
-          cd kernel-src
-
-          make ARCH=arm64 LLVM=1 \
-            CROSS_COMPILE="$CROSS_COMPILE" \
-            modules_prepare
-
-      - name: Build MT7601U
+      - name: Build vmlinux
         run: |
           set -o pipefail
+
           cd kernel-src
 
-          make ARCH=arm64 LLVM=1 \
-            CROSS_COMPILE="$CROSS_COMPILE" \
+          (
+            while true; do
+              sleep 120
+
+              echo "[heartbeat $(date +%T)] $(uptime | sed 's/.*load/load/') | mem used: $(free -m | awk '/Mem/{print $3"/"$2" MB"}')"
+
+              ps -eo etimes,pcpu,rss,comm --sort=-pcpu |
+                sed -n '2,4p' |
+                sed 's/^/    /'
+            done
+          ) &
+
+          HB=$!
+
+          trap 'kill $HB 2>/dev/null' EXIT
+
+          make \
+            ARCH=arm64 \
+            LLVM=1 \
             -j"$(nproc)" \
-            M=drivers/net/wireless/mediatek/mt7601u \
-            modules 2>&1 | tee ../build-mt7601u.log
+            vmlinux \
+            2>&1 | tee ../build-vmlinux.log
+
+      - name: Inspect Module.symvers
+        run: |
+          cd kernel-src
+
+          echo "=== Module.symvers ==="
+
+          if [ ! -f Module.symvers ]; then
+            echo "::error::Module.symvers was not generated"
+            exit 1
+          fi
+
+          ls -lh Module.symvers
+
+          echo
+          echo "=== wiphy_new_nm ==="
+
+          grep -E \
+            '(^|[[:space:]])wiphy_new_nm([[:space:]]|$)' \
+            Module.symvers || true
+
+          echo
+          echo "=== Relevant cfg80211 symbols ==="
+
+          grep -E \
+            '[[:space:]](wiphy_new_nm|cfg80211_register_wdev|cfg80211_unregister_wdev|cfg80211_connect_result)[[:space:]]' \
+            Module.symvers || true
+
+          echo
+          echo "=== Module.symvers CRC format ==="
+
+          awk '$2 ~ /wiphy_new_nm/ {
+            print "CRC      :", $1
+            print "SYMBOL   :", $2
+            print "MODULE   :", $3
+            print "EXPORT   :", $4
+          }' Module.symvers || true
+
+      - name: Build modules
+        run: |
+          set -o pipefail
+
+          cd kernel-src
+
+          make \
+            ARCH=arm64 \
+            LLVM=1 \
+            -j"$(nproc)" \
+            modules \
+            2>&1 | tee ../build-modules.log
+
+      - name: Verify generated modules
+        run: |
+          cd kernel-src
+
+          echo "=== FIND MODULES ==="
+
+          find . \
+            \( -name 'cfg80211.ko' \
+            -o -name 'mac80211.ko' \
+            -o -name 'libarc4.ko' \
+            -o -name 'mt7601u.ko' \) \
+            -print
+
+          echo
+          echo "=== cfg80211 ==="
+
+          test -f net/wireless/cfg80211.ko && \
+            modinfo net/wireless/cfg80211.ko | \
+            grep -E '^(filename|vermagic|depends|firmware|alias)' || true
+
+          echo
+          echo "=== mac80211 ==="
+
+          test -f net/mac80211/mac80211.ko && \
+            modinfo net/mac80211/mac80211.ko | \
+            grep -E '^(filename|vermagic|depends|firmware|alias)' || true
+
+          echo
+          echo "=== mt7601u ==="
+
+          test -f drivers/net/wireless/mediatek/mt7601u/mt7601u.ko && \
+            modinfo drivers/net/wireless/mediatek/mt7601u/mt7601u.ko | \
+            grep -E '^(filename|vermagic|depends|firmware|alias)' || true
+
+      - name: Compare mac80211 wiphy_new_nm CRC
+        run: |
+          cd kernel-src
+
+          echo "=== Module.symvers CRC ==="
+
+          grep -E \
+            '(^|[[:space:]])wiphy_new_nm([[:space:]]|$)' \
+            Module.symvers || true
+
+          echo
+          echo "=== mac80211 __versions ==="
+
+          if [ -f net/mac80211/mac80211.ko ]; then
+            readelf -x __versions net/mac80211/mac80211.ko |
+              grep -i -A2 -B2 '2c3b6b13' || true
+          fi
+
+          echo
+          echo "=== modprobe-style dependencies ==="
+
+          if [ -f net/mac80211/mac80211.ko ]; then
+            modinfo net/mac80211/mac80211.ko |
+              grep -E '^(vermagic|depends)'
+          fi
 
       - name: Collect modules
         run: |
           mkdir out
+
           cd kernel-src
 
-          find drivers/net/wireless/mediatek/mt7601u \
-            -name '*.ko' \
+          find . \
+            \( -name 'cfg80211.ko' \
+            -o -name 'mac80211.ko' \
+            -o -name 'libarc4.ko' \
+            -o -name 'mt7601u.ko' \) \
             -exec cp {} ../out/ \;
 
           cd ../out
@@ -138,31 +282,82 @@ jobs:
           llvm-strip --strip-debug *.ko
 
           echo "=== OUTPUT ==="
-          ls -l
+          ls -lh
 
-          for m in mt7601u; do
-            [ -f "$m.ko" ] && {
-              echo "== $m"
-              modinfo "$m.ko" | grep -E "^(filename|vermagic|depends|firmware|alias)"
-            }
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            if [ -f "$m.ko" ]; then
+              echo
+              echo "== $m =="
+
+              modinfo "$m.ko" |
+                grep -E \
+                  '^(filename|vermagic|depends|firmware|alias)'
+            fi
           done
 
-      - name: Check MT7601U symbols
+      - name: Check symbols against GKI allowlist
         continue-on-error: true
         run: |
-          cd out
+          cd kernel-src
 
-          echo "=== UNDEFINED SYMBOLS ==="
-          llvm-nm -u mt7601u.ko | awk '{print $2}' | sort -u
+          if ls android/abi_gki_aarch64* >/dev/null 2>&1; then
+            cat android/abi_gki_aarch64* |
+              grep -vE '^\[|^#|^[[:space:]]*$' |
+              sed 's/^[[:space:]]*//' |
+              sort -u > /tmp/allow
+          else
+            touch /tmp/allow
+          fi
+
+          cd ../out
+
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            if [ -f "$m.ko" ]; then
+              llvm-nm --defined-only "$m.ko" |
+                awk '{print $3}'
+            fi
+          done |
+            sort -u > /tmp/defined
+
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            if [ -f "$m.ko" ]; then
+              llvm-nm -u "$m.ko" |
+                awk '{print $2}'
+            fi
+          done |
+            sort -u > /tmp/undef
+
+          echo "Symbols the modules need that are NOT on the allowlist (may fail to load):"
+
+          comm -23 /tmp/undef /tmp/allow |
+            comm -23 - /tmp/defined |
+            tee /tmp/missing
 
           echo
-          echo "=== MODINFO ==="
-          modinfo mt7601u.ko
+          echo "count: $(wc -l < /tmp/missing)"
+
+      - name: Save Module.symvers
+        run: |
+          mkdir -p diagnostic
+
+          cp kernel-src/Module.symvers \
+            diagnostic/Module.symvers
+
+          cp kernel-src/.config \
+            diagnostic/final.config
+
+          echo "=== Diagnostic files ==="
+          ls -lh diagnostic
 
       - uses: actions/upload-artifact@v4
         with:
           name: mt7601u-modules
           path: out/*.ko
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-diagnostics
+          path: diagnostic/*
 
       - name: Upload build logs
         if: always()

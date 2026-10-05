@@ -21,6 +21,8 @@ jobs:
       REPO: ${{ inputs.kernel_repo }}
       REF: ${{ inputs.kernel_ref }}
       REL: ${{ inputs.kernel_release }}
+      LLVM_IAS: 1
+      KCFLAGS: -Wno-error
     steps:
       - uses: actions/checkout@v4
 
@@ -50,6 +52,7 @@ jobs:
           SUFFIX="-${REL#*-}"
           touch .scmversion
           scripts/config --disable LOCALVERSION_AUTO --set-str LOCALVERSION "$SUFFIX"
+          scripts/config --disable TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST ""
           scripts/config --module CFG80211 --module MAC80211 --module MT7601U
           make ARCH=arm64 LLVM=1 olddefconfig
           GOT="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
@@ -75,6 +78,22 @@ jobs:
           for m in cfg80211 mac80211 libarc4 mt7601u; do
             [ -f $m.ko ] && { echo "== $m"; modinfo $m.ko | grep -E "vermagic|depends"; }
           done
+
+      - name: Check symbols against GKI allowlist
+        continue-on-error: true
+        run: |
+          cd kernel-src
+          cat android/abi_gki_aarch64* | grep -vE '^\[|^#|^[[:space:]]*$' | sed 's/^[[:space:]]*//' | sort -u > /tmp/allow
+          cd ../out
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            [ -f $m.ko ] && { llvm-nm --defined-only $m.ko | awk '{print $3}'; } 
+          done | sort -u > /tmp/defined
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            [ -f $m.ko ] && llvm-nm -u $m.ko | awk '{print $2}'
+          done | sort -u > /tmp/undef
+          echo "Symbols the modules need that are NOT on the allowlist (may fail to load):"
+          comm -23 /tmp/undef /tmp/allow | comm -23 - /tmp/defined | tee /tmp/missing
+          echo "count: $(wc -l < /tmp/missing)"
 
       - uses: actions/upload-artifact@v4
         with:

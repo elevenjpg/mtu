@@ -1,0 +1,84 @@
+name: Build mt7601u WiFi modules (arm64 GKI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: Kernel source repo
+        default: https://android.googlesource.com/kernel/common
+      kernel_ref:
+        description: Branch, tag or FULL commit sha (short shas can't be fetched)
+        default: android12-5.10
+      kernel_release:
+        description: Exact `uname -r` from the phone
+        default: 5.10.236-android12-9-00006-g71f3aedc8b92-ab14427738
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      REPO: ${{ inputs.kernel_repo }}
+      REF: ${{ inputs.kernel_ref }}
+      REL: ${{ inputs.kernel_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          df -h /
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm flex bison bc libssl-dev libelf-dev cpio kmod
+
+      - name: Fetch kernel source (shallow)
+        run: |
+          git init kernel-src
+          cd kernel-src
+          git remote add origin "$REPO"
+          git fetch --depth=1 origin "$REF"
+          git checkout FETCH_HEAD
+
+      - name: Configure
+        run: |
+          test -f phone.config || { echo "Commit phone.config (zcat /proc/config.gz) to the repo root"; exit 1; }
+          cp phone.config kernel-src/.config
+          cd kernel-src
+          BASE="${REL%%-*}"
+          SUFFIX="-${REL#*-}"
+          touch .scmversion
+          scripts/config --disable LOCALVERSION_AUTO --set-str LOCALVERSION "$SUFFIX"
+          scripts/config --module CFG80211 --module MAC80211 --module MT7601U
+          make ARCH=arm64 LLVM=1 olddefconfig
+          GOT="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
+          echo "source version : $(make -s kernelversion)"
+          echo "kernelrelease  : $GOT"
+          echo "phone uname -r : $REL"
+          [ "$GOT" = "$REL" ] || { echo "::error::Release mismatch: source base version differs from phone (need $BASE). Use the right branch/tag/commit."; exit 1; }
+          grep -E "TRIM_UNUSED_KSYMS|MODVERSIONS|CFG80211|MAC80211|MT7601U" .config || true
+
+      - name: Build
+        run: |
+          cd kernel-src
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules
+
+      - name: Collect modules
+        run: |
+          mkdir out
+          cd kernel-src
+          find . -name '*.ko' -exec cp {} ../out/ \;
+          cd ../out
+          llvm-strip --strip-debug *.ko
+          ls -l
+          for m in cfg80211 mac80211 libarc4 mt7601u; do
+            [ -f $m.ko ] && { echo "== $m"; modinfo $m.ko | grep -E "vermagic|depends"; }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mt7601u-modules
+          path: out/*.ko
+          

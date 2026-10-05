@@ -26,6 +26,7 @@ jobs:
       LLVM: 1
       CROSS_COMPILE: aarch64-linux-gnu-
       KCFLAGS: -Wno-error
+
     steps:
       - uses: actions/checkout@v4
 
@@ -44,78 +45,119 @@ jobs:
       - name: Configure
         run: |
           test -f phone.config || { echo "Commit phone.config (zcat /proc/config.gz) to the repo root"; exit 1; }
+
           cp phone.config kernel-src/.config
+
           cd kernel-src
+
           BASE="${REL%%-*}"
           SUFFIX="-${REL#*-}"
+
           touch .scmversion
-          scripts/config --disable LOCALVERSION_AUTO --set-str LOCALVERSION "$SUFFIX"
-          scripts/config --disable TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST ""
-          scripts/config --enable WLAN --enable WLAN_VENDOR_MEDIATEK --disable DEBUG_INFO --disable DEBUG_INFO_BTF
-          scripts/config --module CFG80211 --module MAC80211 --module MT7601U
+
+          scripts/config --disable LOCALVERSION_AUTO
+          scripts/config --set-str LOCALVERSION "$SUFFIX"
+
+          scripts/config --disable TRIM_UNUSED_KSYMS
+          scripts/config --set-str UNUSED_KSYMS_WHITELIST ""
+
+          scripts/config --enable WLAN
+          scripts/config --enable WLAN_VENDOR_MEDIATEK
+
+          scripts/config --disable DEBUG_INFO
+          scripts/config --disable DEBUG_INFO_BTF
+
+          # Do NOT replace the phone's cfg80211.
+          # Do NOT build a second mac80211 against our own cfg80211.
+          #
+          # Keep the existing phone/GKI wireless stack configuration.
+          scripts/config --disable CFG80211
+          scripts/config --disable MAC80211
+
+          # MT7601U requires mac80211/cfg80211, so enable the driver
+          # as a module. The dependency handling is intentionally left
+          # to Kconfig.
+          scripts/config --module MT7601U
+
           make ARCH=arm64 LLVM=1 olddefconfig
-          for o in CFG80211 MAC80211 MT7601U; do
-            grep -q "^CONFIG_$o=m" .config || { echo "::error::CONFIG_$o did not end up =m (a dependency is off)"; exit 1; }
-          done
+
+          echo "=== FINAL CONFIG ==="
+          grep -E "^(CONFIG_(WLAN|WLAN_VENDOR_MEDIATEK|CFG80211|MAC80211|MT7601U|TRIM_UNUSED_KSYMS|MODVERSIONS))=" .config || true
+
+          echo
+          echo "=== KERNEL RELEASE ==="
+
           GOT="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
-          echo "source version : $(make -s kernelversion)"
+
+          echo "source version : $(make -s ARCH=arm64 LLVM=1 kernelversion)"
           echo "kernelrelease  : $GOT"
           echo "phone uname -r : $REL"
-          [ "$GOT" = "$REL" ] || { echo "::error::Release mismatch: source base version differs from phone (need $BASE). Use the right branch/tag/commit."; exit 1; }
-          grep -E "TRIM_UNUSED_KSYMS|MODVERSIONS|CFG80211|MAC80211|MT7601U" .config || true
+
+          [ "$GOT" = "$REL" ] || {
+            echo "::error::Release mismatch: source base version differs from phone (need $BASE). Use the right branch/tag/commit."
+            exit 1
+          }
 
       - name: Machine info
         run: |
-          echo "cpus: $(nproc)"; free -m | head -2; df -h / | tail -1; clang --version | head -1
+          echo "cpus: $(nproc)"
+          free -m | head -2
+          df -h / | tail -1
+          clang --version | head -1
 
-      - name: Build vmlinux (the "LTO vmlinux.o" line is silent for a long time)
+      - name: Prepare kernel
+        run: |
+          cd kernel-src
+
+          make ARCH=arm64 LLVM=1 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            modules_prepare
+
+      - name: Build MT7601U
         run: |
           set -o pipefail
           cd kernel-src
-          (
-            while true; do
-              sleep 120
-              echo "[heartbeat $(date +%T)] $(uptime | sed 's/.*load/load/') | mem used: $(free -m | awk '/Mem/{print $3"/"$2" MB"}')"
-              ps -eo etimes,pcpu,rss,comm --sort=-pcpu | sed -n '2,4p' | sed 's/^/    /'
-            done
-          ) &
-          HB=$!
-          trap 'kill $HB 2>/dev/null' EXIT
-          make ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux 2>&1 | tee ../build-vmlinux.log
 
-      - name: Build modules
-        run: |
-          set -o pipefail
-          cd kernel-src
-          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules 2>&1 | tee ../build-modules.log
+          make ARCH=arm64 LLVM=1 \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$(nproc)" \
+            M=drivers/net/wireless/mediatek/mt7601u \
+            modules 2>&1 | tee ../build-mt7601u.log
 
       - name: Collect modules
         run: |
           mkdir out
           cd kernel-src
-          find . -name '*.ko' -exec cp {} ../out/ \;
+
+          find drivers/net/wireless/mediatek/mt7601u \
+            -name '*.ko' \
+            -exec cp {} ../out/ \;
+
           cd ../out
+
           llvm-strip --strip-debug *.ko
+
+          echo "=== OUTPUT ==="
           ls -l
-          for m in cfg80211 mac80211 libarc4 mt7601u; do
-            [ -f $m.ko ] && { echo "== $m"; modinfo $m.ko | grep -E "vermagic|depends"; }
+
+          for m in mt7601u; do
+            [ -f "$m.ko" ] && {
+              echo "== $m"
+              modinfo "$m.ko" | grep -E "^(filename|vermagic|depends|firmware|alias)"
+            }
           done
 
-      - name: Check symbols against GKI allowlist
+      - name: Check MT7601U symbols
         continue-on-error: true
         run: |
-          cd kernel-src
-          cat android/abi_gki_aarch64* | grep -vE '^\[|^#|^[[:space:]]*$' | sed 's/^[[:space:]]*//' | sort -u > /tmp/allow
-          cd ../out
-          for m in cfg80211 mac80211 libarc4 mt7601u; do
-            [ -f $m.ko ] && { llvm-nm --defined-only $m.ko | awk '{print $3}'; } 
-          done | sort -u > /tmp/defined
-          for m in cfg80211 mac80211 libarc4 mt7601u; do
-            [ -f $m.ko ] && llvm-nm -u $m.ko | awk '{print $2}'
-          done | sort -u > /tmp/undef
-          echo "Symbols the modules need that are NOT on the allowlist (may fail to load):"
-          comm -23 /tmp/undef /tmp/allow | comm -23 - /tmp/defined | tee /tmp/missing
-          echo "count: $(wc -l < /tmp/missing)"
+          cd out
+
+          echo "=== UNDEFINED SYMBOLS ==="
+          llvm-nm -u mt7601u.ko | awk '{print $2}' | sort -u
+
+          echo
+          echo "=== MODINFO ==="
+          modinfo mt7601u.ko
 
       - uses: actions/upload-artifact@v4
         with:

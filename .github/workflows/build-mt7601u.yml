@@ -51,7 +51,7 @@ jobs:
           touch .scmversion
           scripts/config --disable LOCALVERSION_AUTO --set-str LOCALVERSION "$SUFFIX"
           scripts/config --disable TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST ""
-          scripts/config --enable WLAN --enable WLAN_VENDOR_MEDIATEK --disable DEBUG_INFO_BTF
+          scripts/config --enable WLAN --enable WLAN_VENDOR_MEDIATEK --disable DEBUG_INFO --disable DEBUG_INFO_BTF
           scripts/config --module CFG80211 --module MAC80211 --module MT7601U
           make ARCH=arm64 LLVM=1 olddefconfig
           for o in CFG80211 MAC80211 MT7601U; do
@@ -64,10 +64,30 @@ jobs:
           [ "$GOT" = "$REL" ] || { echo "::error::Release mismatch: source base version differs from phone (need $BASE). Use the right branch/tag/commit."; exit 1; }
           grep -E "TRIM_UNUSED_KSYMS|MODVERSIONS|CFG80211|MAC80211|MT7601U" .config || true
 
-      - name: Build
+      - name: Machine info
         run: |
+          echo "cpus: $(nproc)"; free -m | head -2; df -h / | tail -1; clang --version | head -1
+
+      - name: Build vmlinux (the "LTO vmlinux.o" line is silent for a long time)
+        run: |
+          set -o pipefail
           cd kernel-src
-          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules
+          (
+            while true; do
+              sleep 120
+              echo "[heartbeat $(date +%T)] $(uptime | sed 's/.*load/load/') | mem used: $(free -m | awk '/Mem/{print $3"/"$2" MB"}')"
+              ps -eo etimes,pcpu,rss,comm --sort=-pcpu | sed -n '2,4p' | sed 's/^/    /'
+            done
+          ) &
+          HB=$!
+          trap 'kill $HB 2>/dev/null' EXIT
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux 2>&1 | tee ../build-vmlinux.log
+
+      - name: Build modules
+        run: |
+          set -o pipefail
+          cd kernel-src
+          make ARCH=arm64 LLVM=1 -j"$(nproc)" modules 2>&1 | tee ../build-modules.log
 
       - name: Collect modules
         run: |
@@ -101,3 +121,11 @@ jobs:
         with:
           name: mt7601u-modules
           path: out/*.ko
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: build-*.log
+          if-no-files-found: ignore

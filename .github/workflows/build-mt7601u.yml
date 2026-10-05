@@ -22,19 +22,17 @@ jobs:
       REF: ${{ inputs.kernel_ref }}
       REL: ${{ inputs.kernel_release }}
       LLVM_IAS: 1
+      ARCH: arm64
+      LLVM: 1
+      CROSS_COMPILE: aarch64-linux-gnu-
       KCFLAGS: -Wno-error
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
-          df -h /
-
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld llvm flex bison bc libssl-dev libelf-dev cpio kmod
+          sudo apt-get install -y clang lld llvm flex bison bc libssl-dev libelf-dev cpio kmod gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
 
       - name: Fetch kernel source (shallow)
         run: |
@@ -53,8 +51,12 @@ jobs:
           touch .scmversion
           scripts/config --disable LOCALVERSION_AUTO --set-str LOCALVERSION "$SUFFIX"
           scripts/config --disable TRIM_UNUSED_KSYMS --set-str UNUSED_KSYMS_WHITELIST ""
+          scripts/config --enable WLAN --enable WLAN_VENDOR_MEDIATEK --disable DEBUG_INFO_BTF
           scripts/config --module CFG80211 --module MAC80211 --module MT7601U
           make ARCH=arm64 LLVM=1 olddefconfig
+          for o in CFG80211 MAC80211 MT7601U; do
+            grep -q "^CONFIG_$o=m" .config || { echo "::error::CONFIG_$o did not end up =m (a dependency is off)"; exit 1; }
+          done
           GOT="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
           echo "source version : $(make -s kernelversion)"
           echo "kernelrelease  : $GOT"
